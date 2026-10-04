@@ -35,6 +35,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
@@ -113,6 +114,7 @@ func NewDesiredStateOfWorldPopulator(
 		pods: processedPods{
 			processedPods: make(map[volumetypes.UniquePodName]bool)},
 		hasAddedPods:             false,
+		trigger:                  make(chan struct{}, 1),
 		hasAddedPodsLock:         sync.RWMutex{},
 		csiMigratedPluginManager: csiMigratedPluginManager,
 		intreeToCSITranslator:    intreeToCSITranslator,
@@ -133,6 +135,9 @@ type desiredStateOfWorldPopulator struct {
 	csiMigratedPluginManager csimigration.PluginManager
 	intreeToCSITranslator    csimigration.InTreeToCSITranslator
 	volumePluginMgr          *volume.VolumePluginMgr
+	// trigger wakes runLoop before its next period. It is signalled, without
+	// blocking, by ReprocessPod.
+	trigger chan struct{}
 }
 
 type processedPods struct {
@@ -155,12 +160,34 @@ func (dswp *desiredStateOfWorldPopulator) Run(ctx context.Context, sourcesReady 
 		dswp.hasAddedPods = true
 	}
 	dswp.hasAddedPodsLock.Unlock()
-	wait.UntilWithContext(ctx, dswp.populatorLoop, dswp.loopSleepDuration)
+	dswp.runLoop(ctx)
+}
+
+// runLoop runs populatorLoop every loopSleepDuration, and as soon as
+// ReprocessPod is called, so that the volumes of a pod being synced reach the
+// desired state of world without waiting for the next period.
+func (dswp *desiredStateOfWorldPopulator) runLoop(ctx context.Context) {
+	for {
+		func() {
+			defer utilruntime.HandleCrash()
+			dswp.populatorLoop(ctx)
+		}()
+		select {
+		case <-ctx.Done():
+			return
+		case <-dswp.trigger:
+		case <-time.After(dswp.loopSleepDuration):
+		}
+	}
 }
 
 func (dswp *desiredStateOfWorldPopulator) ReprocessPod(
 	podName volumetypes.UniquePodName) {
 	dswp.markPodProcessingFailed(podName)
+	select {
+	case dswp.trigger <- struct{}{}:
+	default:
+	}
 }
 
 func (dswp *desiredStateOfWorldPopulator) HasAddedPods() bool {

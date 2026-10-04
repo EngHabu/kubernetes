@@ -1620,3 +1620,68 @@ func verifyDesiredSizeLimitInVolumeDsw(
 		}
 	}
 }
+
+// Verifies Changed() is signalled once per batch of changes when a pod is
+// added to or removed from a volume, and not when nothing changes.
+func Test_Changed_AddAndDeletePod(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	volumePluginMgr, _ := volumetesting.GetTestKubeletVolumePluginMgr(t)
+	dsw := NewDesiredStateOfWorld(volumePluginMgr, util.NewFakeSELinuxLabelTranslator())
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod1",
+			UID:  "pod1uid",
+		},
+		Spec: v1.PodSpec{
+			Volumes: []v1.Volume{
+				{
+					Name: "volume-name",
+					VolumeSource: v1.VolumeSource{
+						GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{
+							PDName: "fake-device1",
+						},
+					},
+				},
+			},
+		},
+	}
+	volumeSpec := &volume.Spec{Volume: &pod.Spec.Volumes[0]}
+	podName := util.GetUniquePodName(pod)
+
+	changed := func() bool {
+		select {
+		case <-dsw.Changed():
+			return true
+		default:
+			return false
+		}
+	}
+
+	if changed() {
+		t.Fatalf("Changed() signalled before any change")
+	}
+	volumeName, err := dsw.AddPodToVolume(
+		logger, podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGIDValue */, nil /* seLinuxContainerContexts */)
+	if err != nil {
+		t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
+	}
+	if _, err := dsw.AddPodToVolume(
+		logger, podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGIDValue */, nil /* seLinuxContainerContexts */); err != nil {
+		t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
+	}
+	if !changed() {
+		t.Fatalf("Changed() not signalled after AddPodToVolume")
+	}
+	if changed() {
+		t.Fatalf("Changed() signalled twice for two coalesced changes")
+	}
+
+	dsw.DeletePodFromVolume(podName, volumeName)
+	if !changed() {
+		t.Fatalf("Changed() not signalled after DeletePodFromVolume")
+	}
+	dsw.DeletePodFromVolume(podName, volumeName)
+	if changed() {
+		t.Fatalf("Changed() signalled after deleting a pod that was not in the volume")
+	}
+}

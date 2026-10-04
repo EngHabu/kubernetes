@@ -18,8 +18,9 @@ package reconciler
 
 import (
 	"context"
+	"time"
 
-	"k8s.io/apimachinery/pkg/util/wait"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog/v2"
 )
 
@@ -27,7 +28,20 @@ func (rc *reconciler) Run(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	rc.reconstructVolumes(logger)
 	logger.Info("Reconciler: start to sync state")
-	wait.Until(func() { rc.reconcile(ctx) }, rc.loopSleepDuration, ctx.Done())
+	for {
+		func() {
+			defer utilruntime.HandleCrash()
+			rc.reconcile(ctx)
+		}()
+		// Reconcile again after loopSleepDuration, or as soon as a pod is
+		// added to or removed from the desired state of world.
+		select {
+		case <-ctx.Done():
+			return
+		case <-rc.desiredStateOfWorld.Changed():
+		case <-time.After(rc.loopSleepDuration):
+		}
+	}
 }
 
 func (rc *reconciler) reconcile(ctx context.Context) {

@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kubetypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
@@ -1644,4 +1645,48 @@ func createDswpWithVolumeWithCustomPluginMgr(pv *v1.PersistentVolume, pvc *v1.Pe
 		volumePluginMgr:          fakeVolumePluginMgr,
 	}
 	return dswp, fakePodManager, fakesDSW, fakeRuntime, fakeStateProvider
+}
+
+// Verifies that ReprocessPod wakes the populator loop instead of leaving the
+// pod's volumes until the next loopSleepDuration.
+func TestRunLoop_ReprocessPodWakesLoop(t *testing.T) {
+	dswp, fakePodManager, _ := prepareDswpWithVolume(t)
+	dswp.loopSleepDuration = time.Hour
+	dswp.trigger = make(chan struct{}, 1)
+
+	tCtx := ktesting.Init(t)
+	ctx, cancel := context.WithCancel(tCtx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dswp.runLoop(ctx)
+	}()
+
+	containers := []v1.Container{
+		{
+			VolumeMounts: []v1.VolumeMount{
+				{
+					Name:      "dswp-test-volume-name",
+					MountPath: "/mnt",
+				},
+			},
+		},
+	}
+	pod := createPodWithVolume("dswp-test-pod", "dswp-test-volume-name", "file-bound", containers)
+	podName := util.GetUniquePodName(pod)
+	// Let the loop finish its first pass, which runs before the pod exists.
+	time.Sleep(100 * time.Millisecond)
+	fakePodManager.AddPod(pod)
+	dswp.ReprocessPod(podName)
+
+	err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, 10*time.Second, true, func(context.Context) (bool, error) {
+		return dswp.podPreviouslyProcessed(podName), nil
+	})
+	if err != nil {
+		t.Fatalf("pod %s was not processed after ReprocessPod: %v", podName, err)
+	}
+
+	cancel()
+	<-done
 }

@@ -129,6 +129,12 @@ type DesiredStateOfWorld interface {
 	// them.
 	PopPodErrors(podName types.UniquePodName) []string
 
+	// Changed returns a channel that receives a value after a pod is added to
+	// or removed from a volume. Notifications are coalesced: several changes
+	// may produce a single value. The reconciler uses it to act on a new pod
+	// without waiting for its next period.
+	Changed() <-chan struct{}
+
 	// GetPodsWithErrors returns names of pods that have stored errors.
 	GetPodsWithErrors() []types.UniquePodName
 
@@ -157,6 +163,7 @@ func NewDesiredStateOfWorld(volumePluginMgr *volume.VolumePluginMgr, seLinuxTran
 		volumePluginMgr:   volumePluginMgr,
 		podErrors:         make(map[types.UniquePodName]sets.Set[string]),
 		seLinuxTranslator: seLinuxTranslator,
+		changed:           make(chan struct{}, 1),
 	}
 }
 
@@ -173,6 +180,9 @@ type desiredStateOfWorld struct {
 	podErrors map[types.UniquePodName]sets.Set[string]
 	// seLinuxTranslator translates v1.SELinuxOptions to a file SELinux label.
 	seLinuxTranslator util.SELinuxLabelTranslator
+	// changed is signalled, without blocking, when a pod is added to or
+	// removed from a volume.
+	changed chan struct{}
 
 	sync.RWMutex
 }
@@ -399,6 +409,7 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 		outerVolumeSpecNames: outerVolumeSpecNames,
 		mountRequestTime:     mountRequestTime,
 	}
+	dsw.notifyChanged()
 	return volumeName, nil
 }
 
@@ -477,6 +488,20 @@ func (dsw *desiredStateOfWorld) DeletePodFromVolume(
 	if len(dsw.volumesToMount[volumeName].podsToMount) == 0 {
 		// Delete volume if no child pods left
 		delete(dsw.volumesToMount, volumeName)
+	}
+	dsw.notifyChanged()
+}
+
+func (dsw *desiredStateOfWorld) Changed() <-chan struct{} {
+	return dsw.changed
+}
+
+// notifyChanged signals changed without blocking. A notification that is
+// already pending covers this change too.
+func (dsw *desiredStateOfWorld) notifyChanged() {
+	select {
+	case dsw.changed <- struct{}{}:
+	default:
 	}
 }
 
